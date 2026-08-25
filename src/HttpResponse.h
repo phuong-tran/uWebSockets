@@ -239,6 +239,43 @@ private:
         }
     }
 
+    HttpChunkTrailerEndResult internalEndChunked(
+        std::string_view trailerFields, bool withTrailers,
+        bool closeConnection) {
+        HttpResponseData<SSL> *httpResponseData = getHttpResponseData();
+        if (!(httpResponseData->state & HttpResponseData<SSL>::HTTP_RESPONSE_PENDING) ||
+            !(httpResponseData->state & HttpResponseData<SSL>::HTTP_WRITE_CALLED) ||
+            (httpResponseData->state & HttpResponseData<SSL>::HTTP_LEGACY_CHUNK_CALLED) ||
+            httpResponseData->pendingChunkBytes ||
+            httpResponseData->chunkWriteBlocked ||
+            (withTrailers &&
+             (trailerFields.length() < 5 ||
+              trailerFields.length() > (size_t) INT_MAX ||
+              trailerFields.substr(trailerFields.length() - 2) != "\r\n"))) {
+            return {Super::getBufferedAmount(), false};
+        }
+
+        if (closeConnection) {
+            httpResponseData->state |= HttpResponseData<SSL>::HTTP_CONNECTION_CLOSE;
+        }
+        Super::write("0\r\n", 3);
+        if (withTrailers) {
+            Super::write(trailerFields.data(), (int) trailerFields.length());
+        }
+        Super::write("\r\n", 2);
+        httpResponseData->markDone();
+
+        if (!Super::isCorked() &&
+            (httpResponseData->state & HttpResponseData<SSL>::HTTP_CONNECTION_CLOSE) &&
+            Super::getBufferedAmount() == 0) {
+            Super::shutdown();
+            Super::close();
+            return {0, true};
+        }
+        Super::timeout(HTTP_TIMEOUT_S);
+        return {Super::getBufferedAmount(), true};
+    }
+
 public:
     /* If we have proxy support; returns the proxed source address as reported by the proxy. */
 #ifdef UWS_WITH_PROXY
@@ -527,34 +564,13 @@ public:
      */
     [[nodiscard]] HttpChunkTrailerEndResult endChunkedWithTrailers(
         std::string_view trailerFields, bool closeConnection = false) {
-        HttpResponseData<SSL> *httpResponseData = getHttpResponseData();
-        if (!(httpResponseData->state & HttpResponseData<SSL>::HTTP_RESPONSE_PENDING) ||
-            !(httpResponseData->state & HttpResponseData<SSL>::HTTP_WRITE_CALLED) ||
-            (httpResponseData->state & HttpResponseData<SSL>::HTTP_LEGACY_CHUNK_CALLED) ||
-            httpResponseData->pendingChunkBytes ||
-            httpResponseData->chunkWriteBlocked ||
-            trailerFields.length() < 5 || trailerFields.length() > (size_t) INT_MAX ||
-            trailerFields.substr(trailerFields.length() - 2) != "\r\n") {
-            return {Super::getBufferedAmount(), false};
-        }
+        return internalEndChunked(trailerFields, true, closeConnection);
+    }
 
-        if (closeConnection) {
-            httpResponseData->state |= HttpResponseData<SSL>::HTTP_CONNECTION_CLOSE;
-        }
-        Super::write("0\r\n", 3);
-        Super::write(trailerFields.data(), (int) trailerFields.length());
-        Super::write("\r\n", 2);
-        httpResponseData->markDone();
-
-        if (!Super::isCorked() &&
-            (httpResponseData->state & HttpResponseData<SSL>::HTTP_CONNECTION_CLOSE) &&
-            Super::getBufferedAmount() == 0) {
-            Super::shutdown();
-            Super::close();
-            return {0, true};
-        }
-        Super::timeout(HTTP_TIMEOUT_S);
-        return {Super::getBufferedAmount(), true};
+    /* Ends one modern chunked response with the exact empty final marker. */
+    [[nodiscard]] HttpChunkTrailerEndResult endChunked(
+        bool closeConnection = false) {
+        return internalEndChunked({}, false, closeConnection);
     }
 
     /* End without a body (no content-length) or end with a spoofed content-length. */

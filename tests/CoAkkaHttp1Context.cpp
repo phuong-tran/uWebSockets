@@ -389,12 +389,13 @@ void chunkedTrailerFinalSupportsTrailerOnlyAndKeepAliveReset() {
                 assert(written.valid && !written.blocked);
                 assert(written.consumed == 3U);
             }
-            const std::string_view fields =
-                requestIndex == 0U ? "x-result: one\r\n"
-                                   : "x-result: two\r\n";
-            const auto ended = response->endChunkedWithTrailers(fields);
+            const auto ended = requestIndex == 2U
+                ? response->endChunked()
+                : response->endChunkedWithTrailers(
+                      requestIndex == 0U ? "x-result: one\r\n"
+                                         : "x-result: two\r\n");
             assert(ended.valid && response->hasResponded());
-            if (requests == 2U) {
+            if (requests == 3U) {
                 us_listen_socket_close(0, listenSocket);
             }
         }).listen("127.0.0.1", 0, [&](auto *token) {
@@ -406,7 +407,8 @@ void chunkedTrailerFinalSupportsTrailerOnlyAndKeepAliveReset() {
                 clientResult = exchange(
                     port,
                     "GET /one HTTP/1.1\r\nHost: example.test\r\n\r\n"
-                    "GET /two HTTP/1.1\r\nHost: example.test\r\n"
+                    "GET /two HTTP/1.1\r\nHost: example.test\r\n\r\n"
+                    "GET /three HTTP/1.1\r\nHost: example.test\r\n"
                     "Connection: close\r\n\r\n");
             });
         }).run();
@@ -414,11 +416,13 @@ void chunkedTrailerFinalSupportsTrailerOnlyAndKeepAliveReset() {
 
     client.join();
     assert(clientResult.error == 0);
-    assert(requests == 2U);
+    assert(requests == 3U);
     assert(clientResult.response.find(
                "3\r\none\r\n0\r\nx-result: one\r\n\r\n") !=
            std::string::npos);
     assert(clientResult.response.find("0\r\nx-result: two\r\n\r\n") !=
+           std::string::npos);
+    assert(clientResult.response.find("\r\n\r\n0\r\n\r\n") !=
            std::string::npos);
 }
 

@@ -53,6 +53,10 @@ static_assert(std::is_same_v<
                            .endChunkedWithTrailers(
                                std::declval<std::string_view>())),
               uWS::HttpChunkTrailerEndResult>);
+static_assert(std::is_same_v<
+              decltype(std::declval<uWS::HttpResponse<false> &>()
+                           .endChunked()),
+              uWS::HttpChunkTrailerEndResult>);
 static_assert(
     std::is_same_v<decltype(uWS::HttpChunkTrailerEndResult::bufferedBytes),
                    unsigned int>);
