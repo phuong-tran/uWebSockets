@@ -13,6 +13,8 @@ default:
 	./ExtensionsNegotiator
 	$(CXX) -std=c++17 -fsanitize=address HttpParser.cpp -o HttpParser
 	./HttpParser
+	$(CXX) -std=c++17 -fsanitize=address -I../uSockets/src CoAkkaHttp1.cpp -o CoAkkaHttp1
+	./CoAkkaHttp1
 
 performance:
 	$(CXX) -std=c++17 HttpRouter.cpp -O3 -o HttpRouter

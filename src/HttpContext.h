@@ -31,6 +31,10 @@
 #include "MoveOnlyFunction.h"
 
 namespace uWS {
+
+struct HttpRouteOptions {
+    bool automaticContinue = true;
+};
 template<bool> struct HttpResponse;
 
 template <bool SSL>
@@ -439,7 +443,7 @@ public:
     }
 
     /* Register an HTTP route handler acording to URL pattern */
-    void onHttp(std::string method, std::string pattern, MoveOnlyFunction<void(HttpResponse<SSL> *, HttpRequest *)> &&handler, bool upgrade = false) {
+    void onHttp(std::string method, std::string pattern, MoveOnlyFunction<void(HttpResponse<SSL> *, HttpRequest *)> &&handler, bool upgrade = false, HttpRouteOptions options = {}) {
         HttpContextData<SSL> *httpContextData = getSocketContextData();
 
         /* Todo: This is ugly, fix */
@@ -474,7 +478,7 @@ public:
             }
         }
 
-        httpContextData->currentRouter->add(methods, pattern, [handler = std::move(handler), parameterOffsets = std::move(parameterOffsets)](auto *r) mutable {
+        httpContextData->currentRouter->add(methods, pattern, [handler = std::move(handler), parameterOffsets = std::move(parameterOffsets), options](auto *r) mutable {
             auto user = r->getUserData();
             user.httpRequest->setYield(false);
             user.httpRequest->setParameters(r->getParameters());
@@ -482,7 +486,7 @@ public:
 
             /* Middleware? Automatically respond to expectations */
             std::string_view expect = user.httpRequest->getHeader("expect");
-            if (expect.length() && expect == "100-continue") {
+            if (options.automaticContinue && expect.length() && expect == "100-continue") {
                 user.httpResponse->writeContinue();
             }
 

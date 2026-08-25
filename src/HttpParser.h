@@ -289,16 +289,16 @@ private:
         return (void *)p;
     }
 
-    /* Puts method as key, target as value and returns non-null (or nullptr on error). */
+    /* Puts method as key, raw request-target as value and returns non-null (or nullptr on error). */
     static inline char *consumeRequestLine(char *data, char *end, HttpRequest::Header &header) {
-        /* Scan until single SP, assume next is / (origin request) */
+        /* Scan until the required single SP before a non-empty request-target. */
         char *start = data;
         /* This catches the post padded CR and fails */
         while (data[0] > 32) data++;
         if (&data[1] == end) [[unlikely]] {
             return nullptr;
         }
-        if (data[0] == 32 && data[1] == '/') [[likely]] {
+        if (data[0] == 32 && data[1] > 32) [[likely]] {
             header.key = {start, (size_t) (data - start)};
             data++;
             /* Scan for less than 33 (catches post padded CR and fails) */

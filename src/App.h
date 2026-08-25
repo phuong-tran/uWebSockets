@@ -543,9 +543,9 @@ public:
     }
 
     /* This one catches any method */
-    TemplatedApp &&any(std::string pattern, MoveOnlyFunction<void(HttpResponse<SSL> *, HttpRequest *)> &&handler) {
+    TemplatedApp &&any(std::string pattern, MoveOnlyFunction<void(HttpResponse<SSL> *, HttpRequest *)> &&handler, HttpRouteOptions options = {}) {
         if (httpContext) {
-            httpContext->onHttp("*", pattern, std::move(handler));
+            httpContext->onHttp("*", pattern, std::move(handler), false, options);
         }
         return std::move(static_cast<TemplatedApp &&>(*this));
     }
