@@ -37,6 +37,13 @@
 
 namespace uWS {
 
+struct HttpChunkWriteResult {
+    size_t consumed;
+    unsigned int bufferedBytes;
+    bool blocked;
+    bool valid;
+};
+
 /* Some pre-defined status constants to use with writeStatus */
 static const char *HTTP_200_OK = "200 OK";
 
@@ -90,6 +97,16 @@ private:
     /* Returns true on success, indicating that it might be feasible to write more data.
      * Will start timeout if stream reaches totalSize or write failure. */
     bool internalEnd(std::string_view data, uintmax_t totalSize, bool optional, bool allowContentLength = true, bool closeConnection = false) {
+        HttpResponseData<SSL> *httpResponseData = getHttpResponseData();
+
+        /* Refuse a premature chunk terminal before headers or socket state change. */
+        if ((httpResponseData->state & HttpResponseData<SSL>::HTTP_TRY_CHUNK_CALLED) &&
+            (httpResponseData->pendingChunkBytes ||
+             httpResponseData->chunkWriteBlocked || data.length())) {
+            Super::timeout(HTTP_TIMEOUT_S);
+            return false;
+        }
+
         /* Write status if not already done */
         writeStatus(HTTP_200_OK);
 
@@ -97,8 +114,6 @@ private:
         if (!totalSize) {
             totalSize = data.length();
         }
-
-        HttpResponseData<SSL> *httpResponseData = getHttpResponseData();
 
         /* In some cases, such as when refusing huge data we want to close the connection when drained */
         if (closeConnection) {
@@ -116,21 +131,18 @@ private:
         }
 
         if (httpResponseData->state & HttpResponseData<SSL>::HTTP_WRITE_CALLED) {
-
-            /* We do not have tryWrite-like functionalities, so ignore optional in this path */
-
-            /* Do not allow sending 0 chunk here */
-            if (data.length()) {
-                Super::write("\r\n", 2);
-                writeUnsignedHex((unsigned int) data.length());
-                Super::write("\r\n", 2);
-
-                /* Ignoring optional for now */
-                Super::write(data.data(), (int) data.length());
+            if (httpResponseData->state & HttpResponseData<SSL>::HTTP_TRY_CHUNK_CALLED) {
+                Super::write("0\r\n\r\n", 5);
+            } else {
+                /* Legacy chunk writes buffer any suffix and ignore optional. */
+                if (data.length()) {
+                    Super::write("\r\n", 2);
+                    writeUnsignedHex((unsigned int) data.length());
+                    Super::write("\r\n", 2);
+                    Super::write(data.data(), (int) data.length());
+                }
+                Super::write("\r\n0\r\n\r\n", 7);
             }
-
-            /* Terminating 0 chunk */
-            Super::write("\r\n0\r\n\r\n", 7);
 
             httpResponseData->markDone();
 
@@ -149,7 +161,7 @@ private:
                 }
             }
 
-            /* tryEnd can never fail when in chunked mode, since we do not have tryWrite (yet), only write */
+            /* A completed chunk needs only the fixed terminal marker here. */
             Super::timeout(HTTP_TIMEOUT_S);
             return true;
         } else {
@@ -446,6 +458,60 @@ public:
         }
     }
 
+    /*
+     * Writes one canonical HTTP/1.1 chunk without retaining payload bytes.
+     * A blocked result reports the exact consumed prefix; retry with precisely
+     * the unconsumed suffix after onWritable. Only fixed framing bytes may use
+     * the provider backpressure buffer.
+     */
+    [[nodiscard]] HttpChunkWriteResult tryWriteChunk(std::string_view data) {
+        HttpResponseData<SSL> *httpResponseData = getHttpResponseData();
+        if ((httpResponseData->state & HttpResponseData<SSL>::HTTP_LEGACY_CHUNK_CALLED) ||
+            !data.length() || data.length() > (size_t) INT_MAX ||
+            (httpResponseData->pendingChunkBytes &&
+             data.length() != httpResponseData->pendingChunkBytes)) {
+            return {0, Super::getBufferedAmount(), false, false};
+        }
+        if (httpResponseData->chunkWriteBlocked) {
+            return {0, Super::getBufferedAmount(), true, true};
+        }
+
+        if (!httpResponseData->pendingChunkBytes) {
+            char prefix[16];
+            int prefixLength = utils::u32toaHex((unsigned int) data.length(), prefix);
+            prefix[prefixLength++] = '\r';
+            prefix[prefixLength++] = '\n';
+
+            beginWrite();
+            httpResponseData->state |= HttpResponseData<SSL>::HTTP_TRY_CHUNK_CALLED;
+            httpResponseData->pendingChunkBytes = data.length();
+            auto [written, blocked] = Super::write(prefix, prefixLength);
+            (void) written;
+            if (blocked) {
+                httpResponseData->chunkWriteBlocked = true;
+                Super::timeout(HTTP_TIMEOUT_S);
+                return {0, Super::getBufferedAmount(), true, true};
+            }
+        }
+
+        auto [written, blocked] = Super::write(data.data(), (int) data.length(), true);
+        httpResponseData->pendingChunkBytes -= (size_t) written;
+        if (httpResponseData->pendingChunkBytes) {
+            httpResponseData->chunkWriteBlocked = true;
+            Super::timeout(HTTP_TIMEOUT_S);
+            return {(size_t) written, Super::getBufferedAmount(), true, true};
+        }
+
+        auto [suffixWritten, suffixBlocked] = Super::write("\r\n", 2);
+        (void) suffixWritten;
+        if (blocked || suffixBlocked) {
+            httpResponseData->chunkWriteBlocked = true;
+            Super::timeout(HTTP_TIMEOUT_S);
+        }
+        return {(size_t) written, Super::getBufferedAmount(),
+                blocked || suffixBlocked, true};
+    }
+
     /* End without a body (no content-length) or end with a spoofed content-length. */
     void endWithoutBody(std::optional<size_t> reportedContentLength = std::nullopt, bool closeConnection = false) {
         if (reportedContentLength.has_value()) {
@@ -478,6 +544,11 @@ public:
         }
 
         HttpResponseData<SSL> *httpResponseData = getHttpResponseData();
+
+        if (httpResponseData->state & HttpResponseData<SSL>::HTTP_TRY_CHUNK_CALLED) {
+            return false;
+        }
+        httpResponseData->state |= HttpResponseData<SSL>::HTTP_LEGACY_CHUNK_CALLED;
 
         if (!(httpResponseData->state & HttpResponseData<SSL>::HTTP_WRITE_CALLED)) {
             /* Write mark on first call to write */

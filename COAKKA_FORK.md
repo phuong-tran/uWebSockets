@@ -36,6 +36,18 @@ bounds, cancellation, and wire failure projection.
 - Context opt-in adds one bounded move-only trailer-handler slot to each HTTP
   socket. It owns only the native adapter callback; trailer names and values
   remain borrowed parser views and are never retained by the provider.
+- `HttpResponse::tryWriteChunk` is additive and cannot be mixed with legacy
+  `write`. It emits canonical chunk framing, reports the exact payload prefix
+  consumed, and never copies an unconsumed payload suffix into provider
+  backpressure storage. A blocked caller retries only the exact remaining view
+  after `onWritable`; retry before that event performs no I/O, and mismatched
+  retry length and premature finalization fail before I/O. The provider may
+  retain only fixed head/chunk/final framing bytes.
+- One `size_t` field and one boolean in `HttpResponseData` record the
+  caller-owned payload bytes remaining and the writable-event gate for the
+  current chunk. Request reset and terminal completion clear them. Both are
+  bounded by the existing live-connection ceiling and add no allocator, queue,
+  thread, descriptor, timer, or callback owner.
 
 ## Slice State
 
@@ -50,7 +62,12 @@ bounds, cancellation, and wire failure projection.
   `HttpResponse::onRequestTrailers` before the final `onDataV2` event. The
   per-request handler moves out at trailer delivery or clears at body end, so a
   keep-alive socket cannot retain it into the next idle period.
+- H3a6b0: `tryWriteChunk` supplies the exact non-buffering provider primitive
+  required by CoAkka's lane-owned partial offsets. The context test forces a
+  4 MiB loopback write through partial `onWritable` retries, bounds provider
+  buffering to framing, verifies exact chunk bytes/finalization, rejects a
+  mismatched suffix, and proves keep-alive state reset.
 
 CoAkka HTTP Runtime must not update its dependency lock to an intermediate fork
 commit that still emits body end before request trailers are parsed and
-validated.
+validated or retains an unreported response payload suffix.

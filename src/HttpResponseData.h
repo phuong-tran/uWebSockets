@@ -38,6 +38,8 @@ struct HttpResponseData : AsyncSocketData<SSL>, HttpParser {
         onAborted = nullptr;
         /* Also remove onWritable so that we do not emit when draining behind the scenes. */
         onWritable = nullptr;
+        pendingChunkBytes = 0;
+        chunkWriteBlocked = false;
 
         /* We are done with this request */
         state &= ~HttpResponseData<SSL>::HTTP_RESPONSE_PENDING;
@@ -97,7 +99,9 @@ private:
         HTTP_WRITE_CALLED = 2, // used
         HTTP_END_CALLED = 4, // used
         HTTP_RESPONSE_PENDING = 8, // used
-        HTTP_CONNECTION_CLOSE = 16 // used
+        HTTP_CONNECTION_CLOSE = 16, // used
+        HTTP_TRY_CHUNK_CALLED = 32, // used
+        HTTP_LEGACY_CHUNK_CALLED = 64 // used
     };
 
     /* Per socket event handlers */
@@ -107,6 +111,10 @@ private:
     MoveOnlyFunction<void(HttpRequestTrailers *)> inTrailers;
     /* Outgoing offset */
     uintmax_t offset = 0;
+    /* Caller-owned payload bytes left in the current non-buffering chunk. */
+    size_t pendingChunkBytes = 0;
+    /* Cleared only when the provider dispatches a writable socket event. */
+    bool chunkWriteBlocked = false;
 
     /* Let's track number of bytes since last timeout reset in data handler */
     unsigned int received_bytes_per_timeout = 0;

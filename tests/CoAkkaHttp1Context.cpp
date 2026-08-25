@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cerrno>
 #include <csignal>
 #include <cstring>
@@ -24,7 +25,9 @@ struct ClientResult {
     std::string response;
 };
 
-ClientResult exchange(int port, std::string_view request) {
+ClientResult exchange(int port, std::string_view request,
+                      std::chrono::milliseconds readDelay = {},
+                      int receiveBufferBytes = 0) {
     ClientResult result;
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -35,6 +38,13 @@ ClientResult exchange(int port, std::string_view request) {
     const timeval timeout{5, 0};
     if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) {
+        result.error = errno;
+        close(fd);
+        return result;
+    }
+    if (receiveBufferBytes &&
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receiveBufferBytes,
+                   sizeof(receiveBufferBytes)) != 0) {
         result.error = errno;
         close(fd);
         return result;
@@ -61,6 +71,10 @@ ClientResult exchange(int port, std::string_view request) {
             return result;
         }
         sent += static_cast<std::size_t>(written);
+    }
+
+    if (readDelay.count()) {
+        std::this_thread::sleep_for(readDelay);
     }
 
     char buffer[1024];
@@ -201,6 +215,194 @@ void nonTrailerRequestReleasesHandlerAtBodyEnd() {
     assert(trailerHandlerOwner.expired());
 }
 
+void nonBufferingChunkWriteRetriesExactSuffix() {
+    constexpr std::size_t payloadBytes = 4U * 1024U * 1024U;
+    const std::string payload(payloadBytes, 'x');
+    us_listen_socket_t *listenSocket = nullptr;
+    ClientResult clientResult;
+    std::thread client;
+    std::size_t consumed = 0;
+    std::size_t blockedCalls = 0;
+    unsigned int maxProviderBuffer = 0;
+    bool prematureRetryBlocked = false;
+    bool checkMismatchedRetry = false;
+    bool mismatchedRetryRejected = false;
+
+    {
+        uWS::App app;
+        app.any("/*", [&](auto *response, auto */*request*/) {
+            response->onAborted([]() { assert(false && "stream aborted"); });
+            auto drive = [&, response]() {
+                if (consumed == payload.size()) {
+                    response->end();
+                    us_listen_socket_close(0, listenSocket);
+                    return true;
+                }
+
+                const std::string_view remaining =
+                    std::string_view(payload).substr(consumed);
+                if (checkMismatchedRetry && remaining.size() > 1U) {
+                    const auto rejected =
+                        response->tryWriteChunk(remaining.substr(1U));
+                    mismatchedRetryRejected = !rejected.valid &&
+                                              rejected.consumed == 0U &&
+                                              !rejected.blocked;
+                    checkMismatchedRetry = false;
+                }
+                const auto written = response->tryWriteChunk(remaining);
+                assert(written.valid);
+                assert(written.consumed <= remaining.size());
+                consumed += written.consumed;
+                maxProviderBuffer =
+                    std::max(maxProviderBuffer, written.bufferedBytes);
+                if (written.blocked) {
+                    ++blockedCalls;
+                    const auto prematureFinal = response->tryEnd("invalid");
+                    assert(!prematureFinal.first && !prematureFinal.second);
+                    if (!prematureRetryBlocked) {
+                        const auto premature =
+                            response->tryWriteChunk(
+                                std::string_view(payload).substr(consumed));
+                        prematureRetryBlocked = premature.valid &&
+                                                premature.blocked &&
+                                                premature.consumed == 0U;
+                    }
+                    if (consumed < payload.size() &&
+                        !mismatchedRetryRejected) {
+                        checkMismatchedRetry = true;
+                    }
+                    return false;
+                }
+                assert(consumed == payload.size());
+                response->end();
+                us_listen_socket_close(0, listenSocket);
+                return true;
+            };
+            response->onWritable(
+                [drive](uintmax_t) mutable { return drive(); });
+            (void) drive();
+        }).listen("127.0.0.1", 0, [&](auto *token) {
+            assert(token);
+            listenSocket = token;
+            int port = us_socket_local_port(
+                0, reinterpret_cast<us_socket_t *>(listenSocket));
+            client = std::thread([&clientResult, port]() {
+                clientResult = exchange(
+                    port,
+                    "GET /stream HTTP/1.1\r\n"
+                    "Host: example.test\r\n"
+                    "Connection: close\r\n\r\n",
+                    std::chrono::milliseconds(100), 4096);
+            });
+        }).run();
+    }
+
+    client.join();
+    assert(clientResult.error == 0);
+    assert(consumed == payload.size());
+    assert(blockedCalls != 0);
+    assert(prematureRetryBlocked);
+    assert(mismatchedRetryRejected);
+    assert(maxProviderBuffer < 1024U);
+
+    const std::size_t body = clientResult.response.find("\r\n\r\n");
+    assert(body != std::string::npos);
+    const std::string expected =
+        "400000\r\n" + payload + "\r\n0\r\n\r\n";
+    assert(clientResult.response.substr(body + 4U) == expected);
+}
+
+void nonBufferingChunkStateResetsAcrossKeepAlive() {
+    us_listen_socket_t *listenSocket = nullptr;
+    ClientResult clientResult;
+    std::thread client;
+    unsigned int requests = 0;
+
+    {
+        uWS::App app;
+        app.any("/*", [&](auto *response, auto */*request*/) {
+            response->onAborted([]() { assert(false && "pipeline aborted"); });
+            const std::string_view payload = requests++ ? "two" : "one";
+            const auto written = response->tryWriteChunk(payload);
+            assert(written.valid && !written.blocked);
+            assert(written.consumed == payload.size());
+            response->end();
+            if (requests == 2U) {
+                us_listen_socket_close(0, listenSocket);
+            }
+        }).listen("127.0.0.1", 0, [&](auto *token) {
+            assert(token);
+            listenSocket = token;
+            int port = us_socket_local_port(
+                0, reinterpret_cast<us_socket_t *>(listenSocket));
+            client = std::thread([&clientResult, port]() {
+                clientResult = exchange(
+                    port,
+                    "GET /one HTTP/1.1\r\nHost: example.test\r\n\r\n"
+                    "GET /two HTTP/1.1\r\nHost: example.test\r\n"
+                    "Connection: close\r\n\r\n");
+            });
+        }).run();
+    }
+
+    client.join();
+    assert(clientResult.error == 0);
+    assert(requests == 2U);
+    assert(clientResult.response.find("3\r\none\r\n0\r\n\r\n") !=
+           std::string::npos);
+    assert(clientResult.response.find("3\r\ntwo\r\n0\r\n\r\n") !=
+           std::string::npos);
+}
+
+void chunkWriteModesCannotMix() {
+    us_listen_socket_t *listenSocket = nullptr;
+    ClientResult clientResult;
+    std::thread client;
+    unsigned int requests = 0;
+
+    {
+        uWS::App app;
+        app.any("/*", [&](auto *response, auto */*request*/) {
+            response->onAborted([]() { assert(false && "mixed mode aborted"); });
+            if (requests++ == 0U) {
+                const auto written = response->tryWriteChunk("modern");
+                assert(written.valid && !written.blocked);
+                assert(written.consumed == 6U);
+                assert(!response->write("legacy"));
+            } else {
+                assert(response->write("legacy"));
+                const auto rejected = response->tryWriteChunk("modern");
+                assert(!rejected.valid && !rejected.blocked);
+                assert(rejected.consumed == 0U);
+            }
+            response->end();
+            if (requests == 2U) {
+                us_listen_socket_close(0, listenSocket);
+            }
+        }).listen("127.0.0.1", 0, [&](auto *token) {
+            assert(token);
+            listenSocket = token;
+            int port = us_socket_local_port(
+                0, reinterpret_cast<us_socket_t *>(listenSocket));
+            client = std::thread([&clientResult, port]() {
+                clientResult = exchange(
+                    port,
+                    "GET /try HTTP/1.1\r\nHost: example.test\r\n\r\n"
+                    "GET /legacy HTTP/1.1\r\nHost: example.test\r\n"
+                    "Connection: close\r\n\r\n");
+            });
+        }).run();
+    }
+
+    client.join();
+    assert(clientResult.error == 0);
+    assert(requests == 2U);
+    assert(clientResult.response.find("6\r\nmodern\r\n0\r\n\r\n") !=
+           std::string::npos);
+    assert(clientResult.response.find("6\r\nlegacy\r\n0\r\n\r\n") !=
+           std::string::npos);
+}
+
 } // namespace
 
 int main() {
@@ -209,5 +411,11 @@ int main() {
     requestTrailersPrecedeBodyEnd();
     uWS::Loop::get()->free();
     nonTrailerRequestReleasesHandlerAtBodyEnd();
+    uWS::Loop::get()->free();
+    nonBufferingChunkWriteRetriesExactSuffix();
+    uWS::Loop::get()->free();
+    nonBufferingChunkStateResetsAcrossKeepAlive();
+    uWS::Loop::get()->free();
+    chunkWriteModesCannotMix();
     uWS::Loop::get()->free();
 }

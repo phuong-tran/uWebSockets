@@ -171,6 +171,8 @@ private:
                 /* Reset httpResponse */
                 HttpResponseData<SSL> *httpResponseData = (HttpResponseData<SSL> *) us_socket_ext(SSL, (us_socket_t *) s);
                 httpResponseData->offset = 0;
+                httpResponseData->pendingChunkBytes = 0;
+                httpResponseData->chunkWriteBlocked = false;
 
                 /* Are we not ready for another request yet? Terminate the connection.
                  * Important for denying async pipelining until, if ever, we want to suppot it.
@@ -400,6 +402,7 @@ private:
             if (httpResponseData->onWritable) {
                 /* We are now writable, so hang timeout again, the user does not have to do anything so we should hang until end or tryEnd rearms timeout */
                 us_socket_timeout(SSL, s, 0);
+                httpResponseData->chunkWriteBlocked = false;
 
                 /* We expect the developer to return whether or not write was successful (true).
                  * If write was never called, the developer should still return true so that we may drain. */

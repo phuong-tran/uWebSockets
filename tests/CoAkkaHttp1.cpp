@@ -44,6 +44,10 @@ static_assert(std::is_same_v<
                            .onRequestTrailers(
                                std::declval<RequestTrailerHandler>())),
               void>);
+static_assert(std::is_same_v<
+              decltype(std::declval<uWS::HttpResponse<false> &>()
+                           .tryWriteChunk(std::declval<std::string_view>())),
+              uWS::HttpChunkWriteResult>);
 
 struct Observation {
     unsigned int heads = 0;
