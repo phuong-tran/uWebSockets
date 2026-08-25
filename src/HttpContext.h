@@ -281,6 +281,11 @@ private:
                         httpResponseData->inStream = nullptr;
                     }
                 }
+                if (maxRemainingBodyLength == 0) {
+                    /* A request without chunked trailers must not retain a
+                     * trailer callback into the next keep-alive idle period. */
+                    httpResponseData->inTrailers = nullptr;
+                }
                 return user;
             };
 

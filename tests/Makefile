@@ -17,12 +17,22 @@ default:
 	./CoAkkaHttp1
 
 coakka-http1:
-	$(CXX) -std=c++17 -Wall -Wextra -Werror -I../uSockets/src CoAkkaHttp1.cpp -o CoAkkaHttp1
-	./CoAkkaHttp1
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -Werror -I../uSockets/src CoAkkaHttp1.cpp -o CoAkkaHttp1.strict
+	./CoAkkaHttp1.strict
 
 coakka-http1-ubsan:
-	$(CXX) -std=c++17 -Wall -Wextra -Werror -fsanitize=undefined -fno-sanitize-recover=undefined -I../uSockets/src CoAkkaHttp1.cpp -o CoAkkaHttp1
-	UBSAN_OPTIONS=halt_on_error=1 ./CoAkkaHttp1
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=undefined -fno-sanitize-recover=undefined -I../uSockets/src CoAkkaHttp1.cpp -o CoAkkaHttp1.ubsan
+	UBSAN_OPTIONS=halt_on_error=1 ./CoAkkaHttp1.ubsan
+
+coakka-http1-context:
+	$(MAKE) -C ../uSockets WITH_LIBUV=1 WITH_LTO=0 CFLAGS="$$(pkg-config --cflags libuv)"
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -Werror -pthread -DLIBUS_NO_SSL -DLIBUS_USE_LIBUV -DUWS_NO_ZLIB -I../uSockets/src $$(pkg-config --cflags libuv) CoAkkaHttp1Context.cpp ../uSockets/uSockets.a $$(pkg-config --libs libuv) -o CoAkkaHttp1Context
+	./CoAkkaHttp1Context
+
+coakka-http1-context-ubsan:
+	$(MAKE) -C ../uSockets WITH_LIBUV=1 WITH_LTO=0 CFLAGS="$$(pkg-config --cflags libuv) -fsanitize=undefined -fno-sanitize-recover=undefined"
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -Werror -pthread -DLIBUS_NO_SSL -DLIBUS_USE_LIBUV -DUWS_NO_ZLIB -fsanitize=undefined -fno-sanitize-recover=undefined -I../uSockets/src $$(pkg-config --cflags libuv) CoAkkaHttp1Context.cpp ../uSockets/uSockets.a $$(pkg-config --libs libuv) -o CoAkkaHttp1Context.ubsan
+	UBSAN_OPTIONS=halt_on_error=1 ./CoAkkaHttp1Context.ubsan
 
 performance:
 	$(CXX) -std=c++17 HttpRouter.cpp -O3 -o HttpRouter

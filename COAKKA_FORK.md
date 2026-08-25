@@ -47,7 +47,9 @@ bounds, cancellation, and wire failure projection.
   unchanged.
 - H0c2b: `HttpContextOptions::requestTrailers` keeps the legacy parser path as
   the default. An opted-in context exposes callback-extent fields through
-  `HttpResponse::onRequestTrailers` before the final `onDataV2` event.
+  `HttpResponse::onRequestTrailers` before the final `onDataV2` event. The
+  per-request handler moves out at trailer delivery or clears at body end, so a
+  keep-alive socket cannot retain it into the next idle period.
 
 CoAkka HTTP Runtime must not update its dependency lock to an intermediate fork
 commit that still emits body end before request trailers are parsed and
