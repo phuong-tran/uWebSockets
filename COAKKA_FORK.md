@@ -33,6 +33,9 @@ bounds, cancellation, and wire failure projection.
   their states are mutually exclusive. Trailer progress uses an otherwise
   unreachable value in the existing chunk state word, so the extended path
   adds no per-connection field, string, or steady-state allocation.
+- Context opt-in adds one bounded move-only trailer-handler slot to each HTTP
+  socket. It owns only the native adapter callback; trailer names and values
+  remain borrowed parser views and are never retained by the provider.
 
 ## Slice State
 
@@ -42,8 +45,9 @@ bounds, cancellation, and wire failure projection.
   bounded request trailers and delivers callback-extent fields before body end.
   The original six-argument `consumePostPadded` signature and behavior remain
   unchanged.
-- H0c2b: `HttpContext`/`HttpResponse` opt-in wiring is still required before
-  CoAkka HTTP Runtime may pin this fork.
+- H0c2b: `HttpContextOptions::requestTrailers` keeps the legacy parser path as
+  the default. An opted-in context exposes callback-extent fields through
+  `HttpResponse::onRequestTrailers` before the final `onDataV2` event.
 
 CoAkka HTTP Runtime must not update its dependency lock to an intermediate fork
 commit that still emits body end before request trailers are parsed and

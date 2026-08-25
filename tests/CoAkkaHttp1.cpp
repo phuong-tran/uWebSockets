@@ -13,6 +13,8 @@ namespace {
 
 using PlaintextRouteHandler = uWS::MoveOnlyFunction<
     void(uWS::HttpResponse<false> *, uWS::HttpRequest *)>;
+using RequestTrailerHandler =
+    uWS::MoveOnlyFunction<void(uWS::HttpRequestTrailers *)>;
 using ParserRequestHandler =
     uWS::MoveOnlyFunction<void *(void *, uWS::HttpRequest *)>;
 using ParserDataHandler = uWS::MoveOnlyFunction<
@@ -35,6 +37,13 @@ static_assert(std::is_same_v<
               decltype(&uWS::HttpParser::consumePostPadded),
               LegacyParserConsume>);
 static_assert(sizeof(uWS::HttpParser) == sizeof(UpstreamParserLayout));
+static_assert(std::is_constructible_v<uWS::App, uWS::SocketContextOptions,
+                                      uWS::HttpContextOptions>);
+static_assert(std::is_same_v<
+              decltype(std::declval<uWS::HttpResponse<false> &>()
+                           .onRequestTrailers(
+                               std::declval<RequestTrailerHandler>())),
+              void>);
 
 struct Observation {
     unsigned int heads = 0;
@@ -150,6 +159,10 @@ int main() {
     assert(defaultOptions.automaticContinue);
     uWS::HttpRouteOptions runtimeOwnedContinue{false};
     assert(!runtimeOwnedContinue.automaticContinue);
+    uWS::HttpContextOptions defaultContextOptions;
+    assert(!defaultContextOptions.requestTrailers);
+    uWS::HttpContextOptions trailerAwareContext{true};
+    assert(trailerAwareContext.requestTrailers);
 
     auto origin = parse("GET /resource?q=1 HTTP/1.1\r\nHost: example.test\r\n\r\n");
     assert(origin.returnedUser);
@@ -348,6 +361,20 @@ int main() {
         assert(pipelined.observation.trailerCallbacks == 1);
         assert(pipelined.observation.finals == 2);
     }
+
+    std::string largePipeline = trailerWire;
+    constexpr unsigned int pipelinedRequests = 128;
+    for (unsigned int index = 0; index < pipelinedRequests; index++) {
+        largePipeline.append(
+            "GET /next HTTP/1.1\r\nHost: example.test\r\n\r\n");
+    }
+    auto largePipelined =
+        parseWithTrailers(largePipeline, largePipeline.size());
+    assert(largePipelined.returnedUser);
+    assert(!largePipelined.parserError);
+    assert(largePipelined.observation.heads == pipelinedRequests + 1);
+    assert(largePipelined.observation.trailerCallbacks == 1);
+    assert(largePipelined.observation.finals == pipelinedRequests + 1);
 
     auto legacyTrailer = parse(
         "POST /trailers HTTP/1.1\r\nHost: example.test\r\n"

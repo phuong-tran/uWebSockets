@@ -49,6 +49,7 @@ private:
     HttpRouter<RouterData> router;
     void *upgradedWebSocket = nullptr;
     bool isParsingHttp = false;
+    bool requestTrailers = false;
 
     /* If we are main acceptor, distribute to these apps */
     std::vector<void *> childApps;

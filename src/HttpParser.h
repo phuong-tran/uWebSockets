@@ -664,9 +664,27 @@ private:
             data += consumedFromInput;
             length -= consumedFromInput;
         } else {
-            data[length] = '\r';
-            data[length + 1] = 'a';
-            consumed = getTrailerFields(data, data + length, trailers.headers, err);
+            if (length > MAX_TRAILER_FALLBACK_SIZE) {
+                fallback.reserve(
+                    MAX_TRAILER_FALLBACK_SIZE +
+                    std::max<unsigned int>(MINIMUM_HTTP_POST_PADDING,
+                                           sizeof(std::string)));
+                fallback.append(data, MAX_TRAILER_FALLBACK_SIZE);
+                fallback.resize(MAX_TRAILER_FALLBACK_SIZE +
+                                MINIMUM_HTTP_POST_PADDING);
+                fallback[MAX_TRAILER_FALLBACK_SIZE] = '\r';
+                fallback[MAX_TRAILER_FALLBACK_SIZE + 1] = 'a';
+                consumed = getTrailerFields(
+                    fallback.data(),
+                    fallback.data() + MAX_TRAILER_FALLBACK_SIZE,
+                    trailers.headers, err);
+                fallback.resize(MAX_TRAILER_FALLBACK_SIZE);
+            } else {
+                data[length] = '\r';
+                data[length + 1] = 'a';
+                consumed = getTrailerFields(
+                    data, data + length, trailers.headers, err);
+            }
             if (err) {
                 return {err, FULLPTR, false};
             }

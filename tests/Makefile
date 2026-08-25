@@ -16,6 +16,14 @@ default:
 	$(CXX) -std=c++17 -fsanitize=address -I../uSockets/src CoAkkaHttp1.cpp -o CoAkkaHttp1
 	./CoAkkaHttp1
 
+coakka-http1:
+	$(CXX) -std=c++17 -Wall -Wextra -Werror -I../uSockets/src CoAkkaHttp1.cpp -o CoAkkaHttp1
+	./CoAkkaHttp1
+
+coakka-http1-ubsan:
+	$(CXX) -std=c++17 -Wall -Wextra -Werror -fsanitize=undefined -fno-sanitize-recover=undefined -I../uSockets/src CoAkkaHttp1.cpp -o CoAkkaHttp1
+	UBSAN_OPTIONS=halt_on_error=1 ./CoAkkaHttp1
+
 performance:
 	$(CXX) -std=c++17 HttpRouter.cpp -O3 -o HttpRouter
 	./HttpRouter

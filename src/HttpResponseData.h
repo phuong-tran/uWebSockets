@@ -104,6 +104,7 @@ private:
     MoveOnlyFunction<bool(uintmax_t)> onWritable;
     MoveOnlyFunction<void()> onAborted;
     MoveOnlyFunction<void(std::string_view, uint64_t)> inStream; // onData
+    MoveOnlyFunction<void(HttpRequestTrailers *)> inTrailers;
     /* Outgoing offset */
     uintmax_t offset = 0;
 

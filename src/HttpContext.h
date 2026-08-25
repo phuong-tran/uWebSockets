@@ -35,6 +35,10 @@ namespace uWS {
 struct HttpRouteOptions {
     bool automaticContinue = true;
 };
+
+struct HttpContextOptions {
+    bool requestTrailers = false;
+};
 template<bool> struct HttpResponse;
 
 template <bool SSL>
@@ -158,7 +162,8 @@ private:
 #endif
 
             /* The return value is entirely up to us to interpret. The HttpParser only care for whether the returned value is DIFFERENT or not from passed user */
-            auto [err, returnedSocket] = httpResponseData->consumePostPadded(data, (unsigned int) length, s, proxyParser, [httpContextData](void *s, HttpRequest *httpRequest) -> void * {
+            MoveOnlyFunction<void *(void *, HttpRequest *)> requestHandler =
+                [httpContextData](void *s, HttpRequest *httpRequest) -> void * {
                 /* For every request we reset the timeout and hang until user makes action */
                 /* Warning: if we are in shutdown state, resetting the timer is a security issue! */
                 us_socket_timeout(SSL, (us_socket_t *) s, 0);
@@ -177,6 +182,7 @@ private:
 
                 /* Mark pending request and emit it */
                 httpResponseData->state = HttpResponseData<SSL>::HTTP_RESPONSE_PENDING;
+                httpResponseData->inTrailers = nullptr;
 
                 /* Mark this response as connectionClose if ancient or connection: close */
                 if (httpRequest->isAncient() || httpRequest->getHeader("connection").length() == 5) {
@@ -234,7 +240,11 @@ private:
                 /* Continue parsing */
                 return s;
 
-            }, [httpResponseData](void *user, std::string_view data, uint64_t maxRemainingBodyLength) -> void * {
+            };
+            MoveOnlyFunction<void *(void *, std::string_view, uint64_t)>
+                dataHandler = [httpResponseData](void *user,
+                                                 std::string_view data,
+                                                 uint64_t maxRemainingBodyLength) -> void * {
                 /* We always get an empty chunk even if there is no data */
                 if (httpResponseData->inStream) {
 
@@ -272,7 +282,38 @@ private:
                     }
                 }
                 return user;
-            });
+            };
+
+            std::pair<unsigned int, void *> consumed;
+            if (httpContextData->requestTrailers) {
+                consumed = httpResponseData->consumePostPaddedWithTrailers(
+                    data, (unsigned int) length, s, proxyParser,
+                    std::move(requestHandler), std::move(dataHandler),
+                    [httpContextData, httpResponseData](
+                        void *user, HttpRequestTrailers *trailers) -> void * {
+                        if (httpResponseData->inTrailers) {
+                            auto handler =
+                                std::move(httpResponseData->inTrailers);
+                            handler(trailers);
+
+                            if (httpContextData->upgradedWebSocket) {
+                                return nullptr;
+                            }
+                            if (us_socket_is_closed(SSL,
+                                                    (us_socket_t *) user) ||
+                                us_socket_is_shut_down(SSL,
+                                                       (us_socket_t *) user)) {
+                                return nullptr;
+                            }
+                        }
+                        return user;
+                    });
+            } else {
+                consumed = httpResponseData->consumePostPadded(
+                    data, (unsigned int) length, s, proxyParser,
+                    std::move(requestHandler), std::move(dataHandler));
+            }
+            auto [err, returnedSocket] = consumed;
 
             /* Mark that we are no longer parsing Http */
             httpContextData->isParsingHttp = false;

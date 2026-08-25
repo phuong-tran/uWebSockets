@@ -229,8 +229,13 @@ public:
         other.topicTree = nullptr;
     }
 
-    TemplatedApp(SocketContextOptions options = {}) {
+    TemplatedApp(SocketContextOptions options = {},
+                 HttpContextOptions httpOptions = {}) {
         httpContext = HttpContext<SSL>::create(Loop::get(), options);
+        if (httpContext) {
+            httpContext->getSocketContextData()->requestTrailers =
+                httpOptions.requestTrailers;
+        }
 
         /* Register default handler for 404 (can be overridden by user) */
         this->any("/*", [](auto *res, auto */*req*/) {

@@ -624,6 +624,13 @@ public:
         /* Always reset this counter here */
         data->received_bytes_per_timeout = 0;
     }
+
+    /* Trailer views are borrowed for this callback only. The callback runs
+     * before the final empty onDataV2 event on a trailer-enabled context. */
+    void onRequestTrailers(
+        MoveOnlyFunction<void(HttpRequestTrailers *)> &&handler) {
+        getHttpResponseData()->inTrailers = std::move(handler);
+    }
 };
 
 }
