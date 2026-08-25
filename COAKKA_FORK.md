@@ -48,6 +48,14 @@ bounds, cancellation, and wire failure projection.
   current chunk. Request reset and terminal completion clear them. Both are
   bounded by the existing live-connection ceiling and add no allocator, queue,
   thread, descriptor, timer, or callback owner.
+- `HttpResponse::endChunkedWithTrailers` accepts one nonempty prevalidated
+  canonical field block only while a modern chunked response is pending and no
+  DATA suffix is blocked. Refusal performs no I/O or state transition. Success
+  emits `0\r\n`, the complete borrowed field block, and the final CRLF; any
+  unsent bytes are copied into the existing socket backpressure owner before
+  return. The incremental copy is bounded by the input plus five fixed framing
+  bytes. No caller pointer, new response field, queue, callback, thread,
+  descriptor, timer, or retry state is retained.
 
 ## Slice State
 
@@ -67,6 +75,10 @@ bounds, cancellation, and wire failure projection.
   4 MiB loopback write through partial `onWritable` retries, bounds provider
   buffering to framing, verifies exact chunk bytes/finalization, rejects a
   mismatched suffix, and proves keep-alive state reset.
+- H3b1: `endChunkedWithTrailers` supplies the bounded-copy response trailer
+  final prerequisite. Strict and UBSan context tests prove DATA plus trailers,
+  trailer-only output, exact wire bytes, caller-buffer mutation after return,
+  forced provider backpressure, invalid-state refusal, and keep-alive reset.
 
 CoAkka HTTP Runtime must not update its dependency lock to an intermediate fork
 commit that still emits body end before request trailers are parsed and

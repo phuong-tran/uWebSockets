@@ -259,6 +259,9 @@ void nonBufferingChunkWriteRetriesExactSuffix() {
                     ++blockedCalls;
                     const auto prematureFinal = response->tryEnd("invalid");
                     assert(!prematureFinal.first && !prematureFinal.second);
+                    const auto prematureTrailers =
+                        response->endChunkedWithTrailers("x-result: early\r\n");
+                    assert(!prematureTrailers.valid);
                     if (!prematureRetryBlocked) {
                         const auto premature =
                             response->tryWriteChunk(
@@ -310,6 +313,113 @@ void nonBufferingChunkWriteRetriesExactSuffix() {
     const std::string expected =
         "400000\r\n" + payload + "\r\n0\r\n\r\n";
     assert(clientResult.response.substr(body + 4U) == expected);
+}
+
+void chunkedTrailerFinalCopiesBoundedInput() {
+    constexpr std::size_t trailerValueBytes = 4U * 1024U * 1024U;
+    std::string trailerFields = "x-large: ";
+    trailerFields.append(trailerValueBytes, 'x');
+    trailerFields.append("\r\n");
+    const std::string expectedTrailerFields = trailerFields;
+    us_listen_socket_t *listenSocket = nullptr;
+    ClientResult clientResult;
+    std::thread client;
+    uWS::HttpChunkTrailerEndResult ended{};
+
+    {
+        uWS::App app;
+        app.any("/*", [&](auto *response, auto */*request*/) {
+            response->onAborted(
+                []() { assert(false && "trailer response aborted"); });
+            response->writeHeader("Connection", "close");
+            response->beginWrite();
+            ended = response->endChunkedWithTrailers(trailerFields, true);
+            assert(ended.valid);
+            assert(ended.bufferedBytes <= trailerFields.size() + 5U);
+            std::fill(trailerFields.begin(), trailerFields.end(), 'z');
+            us_listen_socket_close(0, listenSocket);
+        }).listen("127.0.0.1", 0, [&](auto *token) {
+            assert(token);
+            listenSocket = token;
+            int port = us_socket_local_port(
+                0, reinterpret_cast<us_socket_t *>(listenSocket));
+            client = std::thread([&clientResult, port]() {
+                clientResult = exchange(
+                    port,
+                    "GET /trailers HTTP/1.1\r\n"
+                    "Host: example.test\r\n"
+                    "Connection: close\r\n\r\n",
+                    std::chrono::milliseconds(100), 4096);
+            });
+        }).run();
+    }
+
+    client.join();
+    assert(clientResult.error == 0);
+    assert(ended.bufferedBytes != 0U);
+    const std::size_t body = clientResult.response.find("\r\n\r\n");
+    assert(body != std::string::npos);
+    assert(clientResult.response.substr(body + 4U) ==
+           "0\r\n" + expectedTrailerFields + "\r\n");
+}
+
+void chunkedTrailerFinalSupportsTrailerOnlyAndKeepAliveReset() {
+    us_listen_socket_t *listenSocket = nullptr;
+    ClientResult clientResult;
+    std::thread client;
+    unsigned int requests = 0U;
+
+    {
+        uWS::App app;
+        app.any("/*", [&](auto *response, auto */*request*/) {
+            response->onAborted(
+                []() { assert(false && "trailer pipeline aborted"); });
+            response->beginWrite();
+            const auto empty = response->endChunkedWithTrailers({});
+            assert(!empty.valid && !response->hasResponded());
+            const auto noFields =
+                response->endChunkedWithTrailers("\r\n");
+            assert(!noFields.valid && !response->hasResponded());
+            const auto malformed =
+                response->endChunkedWithTrailers("x-result: missing-crlf");
+            assert(!malformed.valid && !response->hasResponded());
+            const auto requestIndex = requests++;
+            if (requestIndex == 0U) {
+                const auto written = response->tryWriteChunk("one");
+                assert(written.valid && !written.blocked);
+                assert(written.consumed == 3U);
+            }
+            const std::string_view fields =
+                requestIndex == 0U ? "x-result: one\r\n"
+                                   : "x-result: two\r\n";
+            const auto ended = response->endChunkedWithTrailers(fields);
+            assert(ended.valid && response->hasResponded());
+            if (requests == 2U) {
+                us_listen_socket_close(0, listenSocket);
+            }
+        }).listen("127.0.0.1", 0, [&](auto *token) {
+            assert(token);
+            listenSocket = token;
+            int port = us_socket_local_port(
+                0, reinterpret_cast<us_socket_t *>(listenSocket));
+            client = std::thread([&clientResult, port]() {
+                clientResult = exchange(
+                    port,
+                    "GET /one HTTP/1.1\r\nHost: example.test\r\n\r\n"
+                    "GET /two HTTP/1.1\r\nHost: example.test\r\n"
+                    "Connection: close\r\n\r\n");
+            });
+        }).run();
+    }
+
+    client.join();
+    assert(clientResult.error == 0);
+    assert(requests == 2U);
+    assert(clientResult.response.find(
+               "3\r\none\r\n0\r\nx-result: one\r\n\r\n") !=
+           std::string::npos);
+    assert(clientResult.response.find("0\r\nx-result: two\r\n\r\n") !=
+           std::string::npos);
 }
 
 void nonBufferingChunkStateResetsAcrossKeepAlive() {
@@ -374,6 +484,9 @@ void chunkWriteModesCannotMix() {
                 const auto rejected = response->tryWriteChunk("modern");
                 assert(!rejected.valid && !rejected.blocked);
                 assert(rejected.consumed == 0U);
+                const auto trailerRejected =
+                    response->endChunkedWithTrailers("x-result: no\r\n");
+                assert(!trailerRejected.valid && !response->hasResponded());
             }
             response->end();
             if (requests == 2U) {
@@ -413,6 +526,10 @@ int main() {
     nonTrailerRequestReleasesHandlerAtBodyEnd();
     uWS::Loop::get()->free();
     nonBufferingChunkWriteRetriesExactSuffix();
+    uWS::Loop::get()->free();
+    chunkedTrailerFinalCopiesBoundedInput();
+    uWS::Loop::get()->free();
+    chunkedTrailerFinalSupportsTrailerOnlyAndKeepAliveReset();
     uWS::Loop::get()->free();
     nonBufferingChunkStateResetsAcrossKeepAlive();
     uWS::Loop::get()->free();

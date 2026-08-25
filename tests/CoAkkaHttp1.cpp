@@ -48,6 +48,16 @@ static_assert(std::is_same_v<
               decltype(std::declval<uWS::HttpResponse<false> &>()
                            .tryWriteChunk(std::declval<std::string_view>())),
               uWS::HttpChunkWriteResult>);
+static_assert(std::is_same_v<
+              decltype(std::declval<uWS::HttpResponse<false> &>()
+                           .endChunkedWithTrailers(
+                               std::declval<std::string_view>())),
+              uWS::HttpChunkTrailerEndResult>);
+static_assert(
+    std::is_same_v<decltype(uWS::HttpChunkTrailerEndResult::bufferedBytes),
+                   unsigned int>);
+static_assert(
+    std::is_same_v<decltype(uWS::HttpChunkTrailerEndResult::valid), bool>);
 
 struct Observation {
     unsigned int heads = 0;

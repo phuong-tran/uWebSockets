@@ -44,6 +44,11 @@ struct HttpChunkWriteResult {
     bool valid;
 };
 
+struct HttpChunkTrailerEndResult {
+    unsigned int bufferedBytes;
+    bool valid;
+};
+
 /* Some pre-defined status constants to use with writeStatus */
 static const char *HTTP_200_OK = "200 OK";
 
@@ -510,6 +515,46 @@ public:
         }
         return {(size_t) written, Super::getBufferedAmount(),
                 blocked || suffixBlocked, true};
+    }
+
+    /*
+     * Ends one modern chunked response with a prevalidated canonical trailer
+     * field block. The block contains one or more complete field lines ending
+     * in CRLF, but not the final empty line. Success consumes or copies every
+     * caller byte before return; only the socket backpressure owner may retain
+     * a copy. closeConnection requires its Connection header to have been
+     * written before beginWrite.
+     */
+    [[nodiscard]] HttpChunkTrailerEndResult endChunkedWithTrailers(
+        std::string_view trailerFields, bool closeConnection = false) {
+        HttpResponseData<SSL> *httpResponseData = getHttpResponseData();
+        if (!(httpResponseData->state & HttpResponseData<SSL>::HTTP_RESPONSE_PENDING) ||
+            !(httpResponseData->state & HttpResponseData<SSL>::HTTP_WRITE_CALLED) ||
+            (httpResponseData->state & HttpResponseData<SSL>::HTTP_LEGACY_CHUNK_CALLED) ||
+            httpResponseData->pendingChunkBytes ||
+            httpResponseData->chunkWriteBlocked ||
+            trailerFields.length() < 5 || trailerFields.length() > (size_t) INT_MAX ||
+            trailerFields.substr(trailerFields.length() - 2) != "\r\n") {
+            return {Super::getBufferedAmount(), false};
+        }
+
+        if (closeConnection) {
+            httpResponseData->state |= HttpResponseData<SSL>::HTTP_CONNECTION_CLOSE;
+        }
+        Super::write("0\r\n", 3);
+        Super::write(trailerFields.data(), (int) trailerFields.length());
+        Super::write("\r\n", 2);
+        httpResponseData->markDone();
+
+        if (!Super::isCorked() &&
+            (httpResponseData->state & HttpResponseData<SSL>::HTTP_CONNECTION_CLOSE) &&
+            Super::getBufferedAmount() == 0) {
+            Super::shutdown();
+            Super::close();
+            return {0, true};
+        }
+        Super::timeout(HTTP_TIMEOUT_S);
+        return {Super::getBufferedAmount(), true};
     }
 
     /* End without a body (no content-length) or end with a spoofed content-length. */
