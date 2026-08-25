@@ -28,6 +28,7 @@
 #include <climits>
 #include <string_view>
 #include <map>
+#include <utility>
 #include "MoveOnlyFunction.h"
 #include "ChunkedEncoding.h"
 
@@ -49,6 +50,7 @@ std::optional<T *> optional_ptr(T *ptr) {
 }
 
 static const size_t MAX_FALLBACK_SIZE = (size_t) atoi(optional_ptr(getenv("UWS_HTTP_MAX_HEADERS_SIZE")).value_or((char *) "4096"));
+static const size_t MAX_TRAILER_FALLBACK_SIZE = 4096;
 #ifndef UWS_HTTP_MAX_HEADERS_COUNT
 #define UWS_HTTP_MAX_HEADERS_COUNT 100
 #endif
@@ -192,12 +194,62 @@ public:
 
 };
 
+/* Callback-extent trailer fields. Views are invalid after the trailer handler
+ * returns and are kept separate from the request head by construction. */
+struct HttpRequestTrailers {
+
+    friend struct HttpParser;
+
+private:
+    struct Header {
+        std::string_view key, value;
+    } headers[UWS_HTTP_MAX_HEADERS_COUNT];
+
+public:
+    struct HeaderIterator {
+        Header *ptr;
+
+        bool operator!=(const HeaderIterator &other) const {
+            if (ptr != other.ptr) {
+                return other.ptr || ptr->key.length();
+            }
+            return false;
+        }
+
+        HeaderIterator &operator++() {
+            ptr++;
+            return *this;
+        }
+
+        std::pair<std::string_view, std::string_view> operator*() const {
+            return {ptr->key, ptr->value};
+        }
+    };
+
+    HeaderIterator begin() {
+        return {headers};
+    }
+
+    HeaderIterator end() {
+        return {nullptr};
+    }
+};
+
 struct HttpParser {
 
 private:
+    /* Head and trailer fallback are mutually exclusive parser states. Reusing
+     * one string avoids another allocator owner on every HTTP connection. */
     std::string fallback;
     /* This guy really has only 30 bits since we reserve two highest bits to chunked encoding parsing state */
     uint64_t remainingStreamingBytes = 0;
+
+    bool isParsingChunkedTrailers() const {
+        /* Chunk payload states always include STATE_IS_CHUNKED or a non-zero
+         * size. STATE_HAS_SIZE alone is therefore available as a trailer
+         * sentinel without growing HttpParser's per-connection layout. */
+        return remainingStreamingBytes == STATE_HAS_SIZE;
+    }
 
     /* Returns UINT64_MAX on error. Maximum 999999999 is allowed. */
     static uint64_t toUnsignedInteger(std::string_view str) {
@@ -469,12 +521,235 @@ private:
         return 0;
     }
 
+    static unsigned int getTrailerFields(char *postPaddedBuffer, char *end,
+                                         HttpRequestTrailers::Header *headers,
+                                         unsigned int &err) {
+        char *start = postPaddedBuffer;
+
+        if (postPaddedBuffer == end) {
+            return 0;
+        }
+        if (postPaddedBuffer[0] == '\r') {
+            if (postPaddedBuffer + 1 == end) {
+                return 0;
+            }
+            if (postPaddedBuffer[1] == '\n') {
+                headers->key = std::string_view(nullptr, 0);
+                return 2;
+            }
+            err = HTTP_ERROR_400_BAD_REQUEST;
+            return 0;
+        }
+
+        for (unsigned int i = 0; i < UWS_HTTP_MAX_HEADERS_COUNT - 1; i++) {
+            char *preliminaryKey = postPaddedBuffer;
+            postPaddedBuffer = (char *) consumeFieldName(postPaddedBuffer);
+            headers->key = std::string_view(preliminaryKey,
+                                            (size_t) (postPaddedBuffer - preliminaryKey));
+
+            if (postPaddedBuffer == preliminaryKey ||
+                postPaddedBuffer[0] != ':') {
+                if (postPaddedBuffer != end) {
+                    err = HTTP_ERROR_400_BAD_REQUEST;
+                }
+                return 0;
+            }
+            postPaddedBuffer++;
+
+            char *preliminaryValue = postPaddedBuffer;
+            while (true) {
+                postPaddedBuffer = (char *) tryConsumeFieldValue(postPaddedBuffer);
+                if (postPaddedBuffer[0] != '\r') {
+                    if (postPaddedBuffer[0] == '\t') {
+                        postPaddedBuffer++;
+                        continue;
+                    }
+                    err = HTTP_ERROR_400_BAD_REQUEST;
+                    return 0;
+                }
+                break;
+            }
+
+            if (postPaddedBuffer[1] != '\n') {
+                if (postPaddedBuffer + 1 < end) {
+                    err = HTTP_ERROR_400_BAD_REQUEST;
+                }
+                return 0;
+            }
+            headers->value = std::string_view(
+                preliminaryValue, (size_t) (postPaddedBuffer - preliminaryValue));
+            postPaddedBuffer += 2;
+
+            while (headers->value.length() && headers->value.back() < 33) {
+                headers->value.remove_suffix(1);
+            }
+            while (headers->value.length() && headers->value.front() < 33) {
+                headers->value.remove_prefix(1);
+            }
+
+            headers++;
+            if (postPaddedBuffer[0] == '\r') {
+                if (postPaddedBuffer[1] == '\n') {
+                    headers->key = std::string_view(nullptr, 0);
+                    return (unsigned int) ((postPaddedBuffer + 2) - start);
+                }
+                if (postPaddedBuffer + 1 < end) {
+                    err = HTTP_ERROR_400_BAD_REQUEST;
+                }
+                return 0;
+            }
+        }
+
+        err = HTTP_ERROR_431_REQUEST_HEADER_FIELDS_TOO_LARGE;
+        return 0;
+    }
+
+    struct TrailerConsumeResult {
+        unsigned int error = 0;
+        void *returnedUser = nullptr;
+        bool complete = false;
+    };
+
+    TrailerConsumeResult consumeTrailerBlock(
+        char *&data, unsigned int &length, void *user,
+        MoveOnlyFunction<void *(void *, std::string_view, uint64_t)> &dataHandler,
+        MoveOnlyFunction<void *(void *, HttpRequestTrailers *)> &trailerHandler) {
+        HttpRequestTrailers trailers;
+        unsigned int consumed = 0;
+        unsigned int err = 0;
+
+        if (fallback.length()) {
+            if (fallback.length() >= MAX_TRAILER_FALLBACK_SIZE) {
+                return {HTTP_ERROR_431_REQUEST_HEADER_FIELDS_TOO_LARGE,
+                        FULLPTR, false};
+            }
+            unsigned int had = (unsigned int) fallback.length();
+            size_t maxCopyDistance = std::min<size_t>(
+                MAX_TRAILER_FALLBACK_SIZE - fallback.length(), (size_t) length);
+
+            fallback.reserve(
+                fallback.length() + maxCopyDistance +
+                std::max<unsigned int>(MINIMUM_HTTP_POST_PADDING,
+                                       sizeof(std::string)));
+            fallback.append(data, maxCopyDistance);
+            size_t bufferedLength = fallback.length();
+            fallback.resize(bufferedLength + MINIMUM_HTTP_POST_PADDING);
+            fallback[bufferedLength] = '\r';
+            fallback[bufferedLength + 1] = 'a';
+
+            consumed = getTrailerFields(
+                fallback.data(), fallback.data() + bufferedLength,
+                trailers.headers, err);
+            fallback.resize(bufferedLength);
+            if (err) {
+                return {err, FULLPTR, false};
+            }
+            if (!consumed) {
+                data += maxCopyDistance;
+                length -= (unsigned int) maxCopyDistance;
+                if (fallback.length() == MAX_TRAILER_FALLBACK_SIZE) {
+                    return {HTTP_ERROR_431_REQUEST_HEADER_FIELDS_TOO_LARGE,
+                            FULLPTR, false};
+                }
+                return {0, user, false};
+            }
+            if (consumed < had) {
+                return {HTTP_ERROR_400_BAD_REQUEST, FULLPTR, false};
+            }
+
+            unsigned int consumedFromInput = consumed - had;
+            if (consumedFromInput > maxCopyDistance) {
+                return {HTTP_ERROR_400_BAD_REQUEST, FULLPTR, false};
+            }
+            data += consumedFromInput;
+            length -= consumedFromInput;
+        } else {
+            data[length] = '\r';
+            data[length + 1] = 'a';
+            consumed = getTrailerFields(data, data + length, trailers.headers, err);
+            if (err) {
+                return {err, FULLPTR, false};
+            }
+            if (!consumed) {
+                if (length >= MAX_TRAILER_FALLBACK_SIZE) {
+                    return {HTTP_ERROR_431_REQUEST_HEADER_FIELDS_TOO_LARGE,
+                            FULLPTR, false};
+                }
+                fallback.reserve(
+                    length + std::max<unsigned int>(MINIMUM_HTTP_POST_PADDING,
+                                                     sizeof(std::string)));
+                fallback.append(data, length);
+                data += length;
+                length = 0;
+                return {0, user, false};
+            }
+            if (consumed > MAX_TRAILER_FALLBACK_SIZE) {
+                return {HTTP_ERROR_431_REQUEST_HEADER_FIELDS_TOO_LARGE,
+                        FULLPTR, false};
+            }
+            data += consumed;
+            length -= consumed;
+        }
+
+        void *returnedUser = trailerHandler(user, &trailers);
+        fallback.clear();
+        remainingStreamingBytes = 0;
+        if (returnedUser != user) {
+            return {0, returnedUser, true};
+        }
+        returnedUser = dataHandler(user, {}, 0);
+        return {0, returnedUser, true};
+    }
+
+    struct ChunkedConsumeResult {
+        unsigned int error = 0;
+        void *returnedUser = nullptr;
+        bool trailersPending = false;
+    };
+
+    ChunkedConsumeResult consumeChunkedData(
+        char *&data, unsigned int &length, void *user,
+        MoveOnlyFunction<void *(void *, std::string_view, uint64_t)> &dataHandler,
+        MoveOnlyFunction<void *(void *, HttpRequestTrailers *)> *trailerHandler) {
+        std::string_view dataToConsume(data, length);
+        if (!trailerHandler) {
+            for (auto chunk : uWS::ChunkIterator(&dataToConsume,
+                                                  &remainingStreamingBytes)) {
+                dataHandler(user, chunk, chunk.length() ? UINT64_MAX : 0);
+            }
+        } else {
+            while (auto chunk =
+                       uWS::getNextChunk(dataToConsume, remainingStreamingBytes)) {
+                if (!chunk->length() &&
+                    remainingStreamingBytes == (STATE_HAS_SIZE | 2)) {
+                    remainingStreamingBytes = STATE_HAS_SIZE;
+                    break;
+                }
+                dataHandler(user, *chunk, UINT64_MAX);
+            }
+        }
+
+        if (isParsingInvalidChunkedEncoding(remainingStreamingBytes)) {
+            return {HTTP_ERROR_400_BAD_REQUEST, FULLPTR, false};
+        }
+        data = (char *) dataToConsume.data();
+        length = (unsigned int) dataToConsume.length();
+
+        if (trailerHandler && isParsingChunkedTrailers()) {
+            TrailerConsumeResult trailerResult = consumeTrailerBlock(
+                data, length, user, dataHandler, *trailerHandler);
+            return {trailerResult.error, trailerResult.returnedUser,
+                    !trailerResult.complete};
+        }
+        return {0, user, false};
+    }
+
     /* This is the only caller of getHeaders and is thus the deepest part of the parser.
      * From here we return either [consumed, user] for "keep going",
       * or [consumed, nullptr] for "break; I am closed or upgraded to websocket"
       * or [whatever, fullptr] for "break and close me, I am a parser error!" */
     template <int CONSUME_MINIMALLY>
-    std::pair<unsigned int, void *> fenceAndConsumePostPadded(char *data, unsigned int length, void *user, void *reserved, HttpRequest *req, MoveOnlyFunction<void *(void *, HttpRequest *)> &requestHandler, MoveOnlyFunction<void *(void *, std::string_view, uint64_t)> &dataHandler) {
+    std::pair<unsigned int, void *> fenceAndConsumePostPadded(char *data, unsigned int length, void *user, void *reserved, HttpRequest *req, MoveOnlyFunction<void *(void *, HttpRequest *)> &requestHandler, MoveOnlyFunction<void *(void *, std::string_view, uint64_t)> &dataHandler, MoveOnlyFunction<void *(void *, HttpRequestTrailers *)> *trailerHandler) {
 
         /* How much data we CONSUMED (to throw away) */
         unsigned int consumedTotal = 0;
@@ -568,18 +843,19 @@ private:
                 remainingStreamingBytes = STATE_IS_CHUNKED;
                 /* If consume minimally, we do not want to consume anything but we want to mark this as being chunked */
                 if (!CONSUME_MINIMALLY) {
-                    /* Go ahead and parse it (todo: better heuristics for emitting FIN to the app level) */
-                    std::string_view dataToConsume(data, length);
-                    for (auto chunk : uWS::ChunkIterator(&dataToConsume, &remainingStreamingBytes)) {
-                        dataHandler(user, chunk, chunk.length() ? UINT64_MAX : 0);
+                    unsigned int before = length;
+                    ChunkedConsumeResult chunkedResult = consumeChunkedData(
+                        data, length, user, dataHandler, trailerHandler);
+                    consumedTotal += before - length;
+                    if (chunkedResult.error) {
+                        return {chunkedResult.error, FULLPTR};
                     }
-                    if (isParsingInvalidChunkedEncoding(remainingStreamingBytes)) {
-                        return {HTTP_ERROR_400_BAD_REQUEST, FULLPTR};
+                    if (chunkedResult.returnedUser != user) {
+                        return {consumedTotal, chunkedResult.returnedUser};
                     }
-                    unsigned int consumed = (length - (unsigned int) dataToConsume.length());
-                    data = (char *) dataToConsume.data();
-                    length = (unsigned int) dataToConsume.length();
-                    consumedTotal += consumed;
+                    if (chunkedResult.trailersPending) {
+                        return {consumedTotal, user};
+                    }
                 }
             } else if (contentLengthString.length()) {
                 remainingStreamingBytes = toUnsignedInteger(contentLengthString);
@@ -614,27 +890,45 @@ private:
         return {consumedTotal, user};
     }
 
-public:
-    std::pair<unsigned int, void *> consumePostPadded(char *data, unsigned int length, void *user, void *reserved, MoveOnlyFunction<void *(void *, HttpRequest *)> &&requestHandler, MoveOnlyFunction<void *(void *, std::string_view, uint64_t)> &&dataHandler) {
+    std::pair<unsigned int, void *> consumePostPaddedImpl(char *data, unsigned int length, void *user, void *reserved, MoveOnlyFunction<void *(void *, HttpRequest *)> &&requestHandler, MoveOnlyFunction<void *(void *, std::string_view, uint64_t)> &&dataHandler, MoveOnlyFunction<void *(void *, HttpRequestTrailers *)> &&trailerHandler) {
 
         /* This resets BloomFilter by construction, but later we also reset it again.
          * Optimize this to skip resetting twice (req could be made global) */
         HttpRequest req;
+        auto *trailerHandlerPointer = trailerHandler ? &trailerHandler : nullptr;
+
+        if (isParsingChunkedTrailers()) {
+            if (!trailerHandlerPointer) {
+                return {HTTP_ERROR_400_BAD_REQUEST, FULLPTR};
+            }
+            TrailerConsumeResult trailerResult = consumeTrailerBlock(
+                data, length, user, dataHandler, *trailerHandlerPointer);
+            if (trailerResult.error) {
+                return {trailerResult.error, FULLPTR};
+            }
+            if (trailerResult.returnedUser != user) {
+                return {0, trailerResult.returnedUser};
+            }
+            if (!trailerResult.complete) {
+                return {0, user};
+            }
+        }
 
         if (remainingStreamingBytes) {
 
             /* It's either chunked or with a content-length */
             if (isParsingChunkedEncoding(remainingStreamingBytes)) {
-                std::string_view dataToConsume(data, length);
-                for (auto chunk : uWS::ChunkIterator(&dataToConsume, &remainingStreamingBytes)) {
-                    /* If we got the zero size chunk, maxRemainingBodyLength is 0, else it is practically infinity */
-                    dataHandler(user, chunk, chunk.length() ? UINT64_MAX : 0);
+                ChunkedConsumeResult chunkedResult = consumeChunkedData(
+                    data, length, user, dataHandler, trailerHandlerPointer);
+                if (chunkedResult.error) {
+                    return {chunkedResult.error, FULLPTR};
                 }
-                if (isParsingInvalidChunkedEncoding(remainingStreamingBytes)) {
-                    return {HTTP_ERROR_400_BAD_REQUEST, FULLPTR};
+                if (chunkedResult.returnedUser != user) {
+                    return {0, chunkedResult.returnedUser};
                 }
-                data = (char *) dataToConsume.data();
-                length = (unsigned int) dataToConsume.length();
+                if (chunkedResult.trailersPending) {
+                    return {0, user};
+                }
             } else {
                 // this is exactly the same as below!
                 // todo: refactor this
@@ -666,7 +960,7 @@ public:
             fallback.append(data, maxCopyDistance);
 
             // break here on break
-            std::pair<unsigned int, void *> consumed = fenceAndConsumePostPadded<true>(fallback.data(), (unsigned int) fallback.length(), user, reserved, &req, requestHandler, dataHandler);
+            std::pair<unsigned int, void *> consumed = fenceAndConsumePostPadded<true>(fallback.data(), (unsigned int) fallback.length(), user, reserved, &req, requestHandler, dataHandler, trailerHandlerPointer);
             if (consumed.second != user) {
                 return consumed;
             }
@@ -683,15 +977,18 @@ public:
                 if (remainingStreamingBytes) {
                     /* It's either chunked or with a content-length */
                     if (isParsingChunkedEncoding(remainingStreamingBytes)) {
-                        std::string_view dataToConsume(data, length);
-                        for (auto chunk : uWS::ChunkIterator(&dataToConsume, &remainingStreamingBytes)) {
-                            dataHandler(user, chunk, chunk.length() ? UINT64_MAX : 0);
+                        ChunkedConsumeResult chunkedResult = consumeChunkedData(
+                            data, length, user, dataHandler,
+                            trailerHandlerPointer);
+                        if (chunkedResult.error) {
+                            return {chunkedResult.error, FULLPTR};
                         }
-                        if (isParsingInvalidChunkedEncoding(remainingStreamingBytes)) {
-                            return {HTTP_ERROR_400_BAD_REQUEST, FULLPTR};
+                        if (chunkedResult.returnedUser != user) {
+                            return {0, chunkedResult.returnedUser};
                         }
-                        data = (char *) dataToConsume.data();
-                        length = (unsigned int) dataToConsume.length();
+                        if (chunkedResult.trailersPending) {
+                            return {0, user};
+                        }
                     } else {
                         // this is exactly the same as above!
                         if (remainingStreamingBytes >= (unsigned int) length) {
@@ -721,7 +1018,7 @@ public:
             }
         }
 
-        std::pair<unsigned int, void *> consumed = fenceAndConsumePostPadded<false>(data, length, user, reserved, &req, requestHandler, dataHandler);
+        std::pair<unsigned int, void *> consumed = fenceAndConsumePostPadded<false>(data, length, user, reserved, &req, requestHandler, dataHandler, trailerHandlerPointer);
         if (consumed.second != user) {
             return consumed;
         }
@@ -739,6 +1036,19 @@ public:
 
         // added for now
         return {0, user};
+    }
+
+public:
+    std::pair<unsigned int, void *> consumePostPadded(char *data, unsigned int length, void *user, void *reserved, MoveOnlyFunction<void *(void *, HttpRequest *)> &&requestHandler, MoveOnlyFunction<void *(void *, std::string_view, uint64_t)> &&dataHandler) {
+        return consumePostPaddedImpl(
+            data, length, user, reserved, std::move(requestHandler),
+            std::move(dataHandler), nullptr);
+    }
+
+    std::pair<unsigned int, void *> consumePostPaddedWithTrailers(char *data, unsigned int length, void *user, void *reserved, MoveOnlyFunction<void *(void *, HttpRequest *)> &&requestHandler, MoveOnlyFunction<void *(void *, std::string_view, uint64_t)> &&dataHandler, MoveOnlyFunction<void *(void *, HttpRequestTrailers *)> &&trailerHandler) {
+        return consumePostPaddedImpl(
+            data, length, user, reserved, std::move(requestHandler),
+            std::move(dataHandler), std::move(trailerHandler));
     }
 };
 
