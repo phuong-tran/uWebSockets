@@ -296,7 +296,7 @@ public:
     }
 
     template <typename UserData>
-    TemplatedApp &&ws(std::string pattern, WebSocketBehavior<UserData> &&behavior) {
+    TemplatedApp &&ws(std::string pattern, WebSocketBehavior<UserData> &&behavior, HttpRouteOptions options = {}) {
         /* Don't compile if alignment rules cannot be satisfied */
         static_assert(alignof(UserData) <= LIBUS_EXT_ALIGNMENT,
         "µWebSockets cannot satisfy UserData alignment requirements. You need to recompile µSockets with LIBUS_EXT_ALIGNMENT adjusted accordingly.");
@@ -464,7 +464,7 @@ public:
                 /* Tell the router that we did not handle this request */
                 req->setYield(true);
             }
-        }, true);
+        }, true, options);
         return std::move(static_cast<TemplatedApp &&>(*this));
     }
 
